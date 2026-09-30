@@ -1,0 +1,7 @@
+.env
+.docker-agent/
+.pytest_cache/
+.venv/
+__pycache__/
+data/
+logs/

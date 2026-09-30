@@ -1,0 +1,8 @@
+requests>=2.32,<3
+pandas>=2.2,<4
+ipykernel>=6,<8
+notebook>=7,<8
+pytest>=8,<10
+python-dotenv>=1,<2
+wqbkit==0.4.7
+psycopg[binary]>=3,<4
