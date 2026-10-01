@@ -14,8 +14,9 @@ from config import load_wqb_credentials
 
 
 API_BASE_URL = "https://api.worldquantbrain.com"
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 60
 PAGE_SIZE = 50
+MAX_POLL_ATTEMPTS = 300  # 防止 Retry-After 轮询死循环
 
 
 # 将添加获得权限的Vector操作符添加在此处
@@ -27,15 +28,86 @@ ts_ops = ["ts_rank", "ts_zscore", "ts_delta",  "ts_sum", "ts_delay",
  
 ops_set = basic_ops + ts_ops 
 
+def _poll_with_retry_after(session, url, *, timeout=DEFAULT_TIMEOUT, max_attempts=MAX_POLL_ATTEMPTS):
+    """轮询一个 URL，直到服务器不再返回 Retry-After 头。
+
+    带有最大尝试次数保护，并对瞬态网络异常（连接/代理/SSL 错误）重试，
+    避免服务器持续返回 Retry-After 或网络抖动时死循环/丢任务。
+    """
+    response = None
+    for attempt in range(max_attempts):
+        try:
+            response = session.get(url, timeout=timeout)
+        except (requests.ReadTimeout, requests.ConnectionError) as exc:
+            wait = 2 * (attempt + 1)
+            print(f"⚠️ 轮询网络异常 ({type(exc).__name__})，{wait}s 后重试...")
+            sleep(wait)
+            continue
+        retry_after = response.headers.get("Retry-After")
+        if not retry_after:
+            return response
+        sleep(float(retry_after))
+    return response
+
+
+def _request_with_retry(
+    session,
+    method,
+    url,
+    *,
+    params=None,
+    json=None,
+    timeout=DEFAULT_TIMEOUT,
+    max_retries=10,
+    base_backoff=2,
+):
+    """带重试的请求：处理 429 限流、5xx、超时、连接错误等瞬态问题。"""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            requester = getattr(session, method.lower())
+            response = requester(url, params=params, json=json, timeout=timeout)
+        except (requests.ReadTimeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            wait = base_backoff * (attempt + 1)
+            print(f"⚠️ 网络异常 ({type(exc).__name__})，{wait}s 后重试...")
+            sleep(wait)
+            continue
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else base_backoff * (attempt + 1)
+            print(f"⚠️ 429 限流，等待 {wait:.1f}s 后重试...")
+            sleep(wait)
+            continue
+        if 500 <= response.status_code < 600:
+            wait = base_backoff * (attempt + 1)
+            print(f"⚠️ 服务器错误 {response.status_code}，{wait}s 后重试...")
+            sleep(wait)
+            continue
+        return response
+    if last_exc is not None:
+        raise last_exc
+    response.raise_for_status()
+    return response
+
+
+def _get_with_rate_limit(session, url, *, params=None, timeout=DEFAULT_TIMEOUT, max_retries=10):
+    """GET 请求，遇到 429 限流时按 Retry-After 头等待后重试。"""
+    return _request_with_retry(
+        session, "GET", url, params=params, timeout=timeout, max_retries=max_retries
+    )
+
+
 def login():
     """Authenticate and return a reusable WorldQuant Brain session."""
     username, password = load_wqb_credentials()
 
     session = requests.Session()
     session.auth = (username, password)
-    response = session.post(
+    response = _request_with_retry(
+        session,
+        "POST",
         f"{API_BASE_URL}/authentication",
-        timeout=DEFAULT_TIMEOUT,
     )
     response.raise_for_status()
     return session
@@ -88,10 +160,10 @@ def get_datafields(
     offset = 0
     while True:
         page_params = {**params, "offset": offset}
-        response = s.get(
+        response = _get_with_rate_limit(
+            s,
             f"{API_BASE_URL}/data-fields",
             params=page_params,
-            timeout=DEFAULT_TIMEOUT,
         )
         response.raise_for_status()
         payload = response.json()
@@ -100,6 +172,7 @@ def get_datafields(
         offset += PAGE_SIZE
         if offset >= count:
             break
+        sleep(0.5)  # 翻页间小延时，避免触发限流
 
     return pd.DataFrame(records)
 
@@ -243,10 +316,11 @@ def single_simulate(alpha_pool, neut, region, universe, start):
             }
 
             try:
-                response = s.post(
+                response = _request_with_retry(
+                    s,
+                    "POST",
                     f"{API_BASE_URL}/simulations",
                     json=simulation_data,
-                    timeout=DEFAULT_TIMEOUT,
                 )
                 response.raise_for_status()
                 progress_url = response.headers.get("Location")
@@ -256,21 +330,13 @@ def single_simulate(alpha_pool, neut, region, universe, start):
             except (requests.RequestException, KeyError) as exc:
                 failures.append((alpha, str(exc).strip("'")))
                 print(f"simulation post failed for {alpha}: {exc}")
+            sleep(0.3)  # 同批提交间小延时，降低限流概率
 
         print("task %d post done"%(x))
 
         for alpha, progress in progress_urls:
             try:
-                while True:
-                    simulation_progress = s.get(
-                        progress,
-                        timeout=DEFAULT_TIMEOUT,
-                    )
-                    retry_after = simulation_progress.headers.get("Retry-After")
-                    if not retry_after:
-                        break
-                    sleep(float(retry_after))
-
+                simulation_progress = _poll_with_retry_after(s, progress)
                 simulation_progress.raise_for_status()
                 status = simulation_progress.json().get("status", 0)
                 if status not in {"COMPLETE", "WARNING"}:
@@ -577,7 +643,7 @@ def check_submission(alpha_bag, gold_bag, start, max_retries=2):
             isinstance(pc, float) and math.isnan(pc)
         )
         if should_retry and retries < max_retries:
-            sleep(100)
+            sleep(30)
             s = login()
             pending.append((idx, g, retries + 1))
         elif should_retry:
@@ -594,16 +660,7 @@ def check_submission(alpha_bag, gold_bag, start, max_retries=2):
 
 
 def get_check_submission(s, alpha_id):
-    while True:
-        result = s.get(
-            f"{API_BASE_URL}/alphas/{alpha_id}/check",
-            timeout=DEFAULT_TIMEOUT,
-        )
-        retry_after = result.headers.get("Retry-After")
-        if retry_after:
-            time.sleep(float(retry_after))
-        else:
-            break
+    result = _poll_with_retry_after(s, f"{API_BASE_URL}/alphas/{alpha_id}/check")
     try:
         result.raise_for_status()
         payload = result.json()
@@ -637,16 +694,7 @@ def view_alphas(gold_bag):
         print(i)
  
 def locate_alpha(s, alpha_id):
-    while True:
-        alpha = s.get(
-            f"{API_BASE_URL}/alphas/{alpha_id}",
-            timeout=DEFAULT_TIMEOUT,
-        )
-        retry_after = alpha.headers.get("Retry-After")
-        if retry_after:
-            time.sleep(float(retry_after))
-        else:
-            break
+    alpha = _poll_with_retry_after(s, f"{API_BASE_URL}/alphas/{alpha_id}")
     alpha.raise_for_status()
     metrics = alpha.json()
     
@@ -692,16 +740,7 @@ def multi_simulate(alpha_pools, neut, region, universe, start):
 
         for task_index, progress in progress_urls:
             try:
-                while True:
-                    simulation_progress = s.get(
-                        progress,
-                        timeout=DEFAULT_TIMEOUT,
-                    )
-                    retry_after = simulation_progress.headers.get("Retry-After")
-                    if not retry_after:
-                        break
-                    sleep(float(retry_after))
-
+                simulation_progress = _poll_with_retry_after(s, progress)
                 simulation_progress.raise_for_status()
                 status = simulation_progress.json().get("status", 0)
                 if status not in {"COMPLETE", "WARNING"}:

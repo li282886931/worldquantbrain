@@ -168,7 +168,7 @@ def test_ts_comp_factory_rejects_unsupported_parameter_types():
 
 
 def test_single_simulate_reports_failed_posts_without_long_sleep(monkeypatch):
-    session = RecordingSession([FakeResponse(status_code=500, content=b"failed")])
+    session = RecordingSession([FakeResponse(status_code=400, content=b"failed")])
     sleeps = []
     monkeypatch.setattr(machine_lib, "login", lambda: session)
     monkeypatch.setattr(machine_lib, "sleep", sleeps.append)
@@ -181,8 +181,9 @@ def test_single_simulate_reports_failed_posts_without_long_sleep(monkeypatch):
         0,
     )
 
-    assert failures == [("rank(close)", "HTTP 500")]
-    assert sleeps == []
+    assert failures == [("rank(close)", "HTTP 400")]
+    # 仅允许短延时（节流用），不允许长休眠
+    assert all(s < 1 for s in sleeps)
 
 
 def test_multi_simulate_handles_empty_pool(monkeypatch):
