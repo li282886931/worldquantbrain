@@ -5,3 +5,5 @@
 __pycache__/
 data/
 logs/
+alpha_machine_checkpoint.json
+alpha_progress_fine.pkl

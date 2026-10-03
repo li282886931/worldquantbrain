@@ -286,7 +286,7 @@ def load_task_pool_single(alpha_list, limit_of_single_simulations):
     return pool
 
 
-def single_simulate(alpha_pool, neut, region, universe, start):
+def single_simulate(alpha_pool, neut, region, universe, start, on_batch_done=None):
     s = login()
     failures = []
 
@@ -347,7 +347,9 @@ def single_simulate(alpha_pool, neut, region, universe, start):
                 print(f"simulation check failed for {progress}: {exc}")
 
         print("task %d simulate done"%(x))
-    
+        if on_batch_done:
+            on_batch_done(x)
+
     print("Simulate done")
     return failures
 

@@ -45,9 +45,11 @@ class FakeMachineLib:
         self.calls.append(("load_task_pool_single", tuple(alpha_list)))
         return [alpha_list]
 
-    def single_simulate(self, pools, neutralization, region, universe, start):
+    def single_simulate(self, pools, neutralization, region, universe, start, on_batch_done=None):
         alpha = pools[0][0][0]
         self.calls.append(("single_simulate", alpha, start))
+        if on_batch_done:
+            on_batch_done(0)
         return []
 
     def get_alphas(self, *args):
@@ -92,8 +94,11 @@ def test_default_config_matches_notebook_values():
     assert config.third_simulation_start == 3
 
 
-def test_run_workflow_executes_all_notebook_stages():
+def test_run_workflow_executes_all_notebook_stages(tmp_path, monkeypatch):
     alpha_machine = load_alpha_machine()
+    monkeypatch.setattr(
+        alpha_machine, "CHECKPOINT_FILE", tmp_path / "checkpoint.json"
+    )
     fake = FakeMachineLib()
 
     result = alpha_machine.run_workflow(
@@ -132,8 +137,11 @@ def test_run_workflow_executes_all_notebook_stages():
     assert result.template_count == 1
 
 
-def test_run_workflow_stops_when_no_data_fields_are_available():
+def test_run_workflow_stops_when_no_data_fields_are_available(tmp_path, monkeypatch):
     alpha_machine = load_alpha_machine()
+    monkeypatch.setattr(
+        alpha_machine, "CHECKPOINT_FILE", tmp_path / "checkpoint.json"
+    )
     fake = FakeMachineLib()
     fake.process_datafields = lambda frame: []
 
@@ -150,6 +158,29 @@ def test_template_factory_creates_balanced_expression():
         "log(1+sigmoid(ts_zscore(sentiment,30))*"
         "sigmoid(ts_zscore(option,30)))"
     ]
+
+
+def test_run_workflow_resumes_from_checkpoint(tmp_path, monkeypatch):
+    alpha_machine = load_alpha_machine()
+    ckpt_file = tmp_path / "checkpoint.json"
+    monkeypatch.setattr(alpha_machine, "CHECKPOINT_FILE", ckpt_file)
+
+    # 模拟断点：一阶数据已生成，模拟已做到第 1 批
+    ckpt_file.write_text(
+        '{"stage": 2, "processed_fields": ["f1"], "first_alpha_list": [["a1", 6], ["a2", 6]], "first_sim_next": 1, "first_layer": [["l1", 6]]}',
+        encoding="utf-8",
+    )
+
+    fake = FakeMachineLib()
+    result = alpha_machine.run_workflow(
+        alpha_machine.WorkflowConfig(), api=fake,
+    )
+
+    # 应跳过 [1/8] 和 [2/8] 的数据生成，直接从 [3/8] 开始
+    assert fake.calls[0][0] == "login"
+    assert fake.calls[1][0] == "get_alphas"
+    assert fake.calls[2][0] == "prune"
+    assert result.first_order_count == 2
 
 
 def test_parse_args_supports_runtime_overrides():

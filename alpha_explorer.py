@@ -13,6 +13,7 @@ Run directly::
 import pickle
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 
 import pandas as pd
@@ -30,6 +31,7 @@ MIN_FITNESS = 1.0
 PROGRESS_FILE = "alpha_progress_fine.pkl"
 
 MAX_SETTINGS_PER_EXPR = 5
+SIMULATIONS_PER_BATCH = 3
 
 QUICK_SETTINGS = {
     "instrumentType": "EQUITY",
@@ -314,42 +316,58 @@ def compare_settings_for_expression(
     best_id, best_sharpe, best_fitness = None, -999, -999
     best_settings = None
 
+    def submit_with_own_session(cfg):
+        worker_sess = make_session(username, password)
+        worker_sess.headers.update(sess.headers)
+        worker_sess.cookies.update(sess.cookies)
+        try:
+            return submit_alpha(
+                worker_sess, username, password, expr, settings=cfg
+            )
+        finally:
+            worker_sess.close()
+
     idx = 0
     while idx < len(tested_list):
-        cfg = tested_list[idx]
-        idx += 1
-        print(
-            f"    ▶ 尝试 Settings: delay={cfg['delay']}, decay={cfg['decay']}, "
-            f"neut={cfg['neutralization']}, trunc={cfg['truncation']}, "
-            f"past={cfg['pasteurization']}, nan={cfg['nanHandling']}"
-        )
-        res = submit_alpha(sess, username, password, expr, settings=cfg)
-        if res["status"] == "success":
-            alpha_id = res["alpha_id"]
-            sharpe, fitness, *_ = get_alpha_details(
-                sess, username, password, alpha_id
+        batch = tested_list[idx : idx + SIMULATIONS_PER_BATCH]
+        idx += len(batch)
+        for cfg in batch:
+            print(
+                f"    ▶ 尝试 Settings: delay={cfg['delay']}, decay={cfg['decay']}, "
+                f"neut={cfg['neutralization']}, trunc={cfg['truncation']}, "
+                f"past={cfg['pasteurization']}, nan={cfg['nanHandling']}"
             )
-            if sharpe is not None and fitness is not None:
-                if not extra_triggered and sharpe >= 1.1 and fitness >= 0.9:
-                    extra_triggered = True
-                    extra_count = min(5, len(reserve_pool))
-                    if extra_count > 0:
-                        extra_samples = random.sample(reserve_pool, extra_count)
-                        tested_list.extend(extra_samples)
-                        for s in extra_samples:
-                            reserve_pool.remove(s)
-                        print(
-                            f"    🔁 触发追加调试：Sharpe={sharpe:.2f}, "
-                            f"Fitness={fitness:.2f} >= 阈值，再测 {extra_count} 组设置"
-                        )
 
-                if sharpe > 1.25 and fitness > 1.0:
-                    if sharpe > best_sharpe:
-                        best_sharpe = sharpe
-                        best_fitness = fitness
-                        best_id = alpha_id
-                        best_settings = cfg
-        time.sleep(2)
+        with ThreadPoolExecutor(max_workers=SIMULATIONS_PER_BATCH) as executor:
+            results = list(executor.map(submit_with_own_session, batch))
+
+        for cfg, res in zip(batch, results):
+            if res["status"] == "success":
+                alpha_id = res["alpha_id"]
+                sharpe, fitness, *_ = get_alpha_details(
+                    sess, username, password, alpha_id
+                )
+                if sharpe is not None and fitness is not None:
+                    if not extra_triggered and sharpe >= 1.1 and fitness >= 0.9:
+                        extra_triggered = True
+                        extra_count = min(5, len(reserve_pool))
+                        if extra_count > 0:
+                            extra_samples = random.sample(reserve_pool, extra_count)
+                            tested_list.extend(extra_samples)
+                            for s in extra_samples:
+                                reserve_pool.remove(s)
+                            print(
+                                f"    🔁 触发追加调试：Sharpe={sharpe:.2f}, "
+                                f"Fitness={fitness:.2f} >= 阈值，再测 {extra_count} 组设置"
+                            )
+
+                    if sharpe > 1.25 and fitness > 1.0:
+                        if sharpe > best_sharpe:
+                            best_sharpe = sharpe
+                            best_fitness = fitness
+                            best_id = alpha_id
+                            best_settings = cfg
+            time.sleep(2)
 
     if best_id:
         return best_id, (best_sharpe, best_fitness, None, None, None), best_settings
