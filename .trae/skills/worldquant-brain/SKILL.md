@@ -5,7 +5,7 @@ description: Interact with the WorldQuant BRAIN API — login, fetch data fields
 
 # WorldQuant BRAIN 交互
 
-所有与 BRAIN API 的交互统一走 [machine_lib.py](file:///d:/code/worldquantbrain/machine_lib.py)，不要在业务脚本里重写 HTTP 逻辑。
+所有与 BRAIN API 的交互统一走项目根目录的 `machine_lib.py`，不要在业务脚本里重写 HTTP 逻辑。
 
 ## 凭证
 
